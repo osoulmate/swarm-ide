@@ -3,6 +3,11 @@ import { ProviderType, ConfigManager } from "./config";
 import { GLMProvider } from "./adapters/glm";
 import { OpenRouterProvider } from "./adapters/openrouter";
 import { DeepSeekProvider } from "./adapters/deepseek";
+import { QwenProvider } from "./adapters/qwen";
+import { KimiProvider } from "./adapters/kimi";
+import { MinimaxProvider } from "./adapters/minimax";
+import { DoubaoProvider } from "./adapters/doubao";
+import { GeminiProvider } from "./adapters/gemini";
 
 // 模型提供商工厂类
 export class ModelProviderFactory {
@@ -30,6 +35,21 @@ export class ModelProviderFactory {
         break;
       case "deepseek":
         provider = new DeepSeekProvider();
+        break;
+      case "qwen":
+        provider = new QwenProvider();
+        break;
+      case "kimi":
+        provider = new KimiProvider();
+        break;
+      case "minimax":
+        provider = new MinimaxProvider();
+        break;
+      case "doubao":
+        provider = new DoubaoProvider();
+        break;
+      case "gemini":
+        provider = new GeminiProvider();
         break;
       default:
         throw new Error(`Unsupported model provider: ${providerType}`);
@@ -63,7 +83,7 @@ export class ModelProviderFactory {
 
   // 列出所有支持的提供商
   static listSupportedProviders(): string[] {
-    return ["glm", "openrouter", "deepseek"];
+    return ["glm", "openrouter", "deepseek", "qwen", "kimi", "minimax", "doubao", "gemini"];
   }
 
   // 验证提供商是否支持

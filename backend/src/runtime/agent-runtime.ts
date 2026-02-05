@@ -1,6 +1,6 @@
 import { parseSSEJsonLines } from "@/lib/glm-stream";
 import { store } from "@/lib/storage";
-import { getProvider, getDefaultProvider } from "@/models/factory";
+import { getDefaultProvider } from "@/models/factory";
 import { ModelRequestParams } from "@/models/provider";
 
 import { exec } from "node:child_process";
@@ -963,7 +963,7 @@ class AgentRunner {
     });
 
     const tools = await getAgentTools();
-    
+
     // 构建请求参数
     const params: ModelRequestParams = {
       messages: history,
@@ -978,11 +978,29 @@ class AgentRunner {
     const requestBody = JSON.stringify(payload);
     void appendAgentLlmRequestRaw({ agentId: this.agentId, body: requestBody });
 
-    const upstream = await fetch(baseUrl, {
-      method: "POST",
-      headers,
-      body: requestBody,
+    console.log('LLM Request:', {
+      provider: provider.name,
+      url: baseUrl.replace(/key=.*$/, 'key=***'),
+      headers: Object.keys(headers),
+      payloadSize: requestBody.length
     });
+
+    let upstream: Response;
+    try {
+      upstream = await fetch(baseUrl, {
+        method: "POST",
+        headers,
+        body: requestBody,
+      });
+
+      console.log('LLM Response:', {
+        status: upstream.status,
+        statusText: upstream.statusText
+      });
+    } catch (error) {
+      console.error('LLM Fetch Error:', error);
+      throw new Error(`Failed to fetch from LLM provider: ${provider.name}`);
+    }
 
     if (!upstream.ok || !upstream.body) {
       await provider.handleErrorResponse(upstream);
