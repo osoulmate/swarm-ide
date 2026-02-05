@@ -3,11 +3,12 @@ export const runtime = "nodejs";
 import { GLMStreamAssembler, parseSSEJsonLines } from "@/lib/glm-stream";
 import { OpenAIStreamAssembler } from "@/lib/openai-stream";
 
-type LlmProvider = "glm" | "openrouter";
+type LlmProvider = "glm" | "openrouter" | "deepseek";
 
 function getProvider(bodyProvider?: string): LlmProvider {
   const raw = (bodyProvider ?? process.env.LLM_PROVIDER ?? "glm").toLowerCase();
   if (raw === "openrouter" || raw === "open-router" || raw === "or") return "openrouter";
+  if (raw === "deepseek" || raw === "ds") return "deepseek";
   return "glm";
 }
 
@@ -28,6 +29,13 @@ function getOpenRouterConfig() {
   const httpReferer = process.env.OPENROUTER_HTTP_REFERER ?? "";
   const appTitle = process.env.OPENROUTER_APP_TITLE ?? "";
   return { apiKey, baseUrl, model, httpReferer, appTitle };
+}
+
+function getDeepSeekConfig() {
+  const apiKey = process.env.DEEPSEEK_API_KEY ?? "";
+  const baseUrl = process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com/v1/chat/completions";
+  const model = process.env.DEEPSEEK_MODEL ?? "";
+  return { apiKey, baseUrl, model };
 }
 
 function stripReasoningFromMessages(
@@ -91,6 +99,80 @@ export async function POST(req: Request) {
       const text = await upstream.text().catch(() => "");
       return Response.json(
         { error: "Upstream OpenRouter error", status: upstream.status, body: text },
+        { status: 502 }
+      );
+    }
+
+    const assembler = new OpenAIStreamAssembler();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        try {
+          for await (const evt of parseSSEJsonLines(upstream.body!)) {
+            const state = assembler.push(evt as any);
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify({ event: "llm.stream", data: state })}\n\n`
+              )
+            );
+          }
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ event: "llm.done", data: assembler.snapshot() })}\n\n`
+            )
+          );
+          controller.close();
+        } catch (err) {
+          controller.error(err);
+        }
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      },
+    });
+  }
+
+  if (provider === "deepseek") {
+    const { apiKey, baseUrl, model } = getDeepSeekConfig();
+    if (!apiKey) {
+      return Response.json(
+        { error: "Missing DeepSeek API key (set DEEPSEEK_API_KEY)" },
+        { status: 500 }
+      );
+    }
+
+    const payload: Record<string, unknown> = {
+      messages: stripReasoningFromMessages(body.messages),
+      stream: true,
+      stream_options: { include_usage: true },
+    };
+    if (body.tools) {
+      payload.tools = body.tools;
+      payload.tool_choice = "auto";
+    }
+    if (body.model ?? model) {
+      payload.model = body.model ?? model;
+    }
+
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    };
+
+    const upstream = await fetch(baseUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+
+    if (!upstream.ok || !upstream.body) {
+      const text = await upstream.text().catch(() => "");
+      return Response.json(
+        { error: "Upstream DeepSeek error", status: upstream.status, body: text },
         { status: 502 }
       );
     }

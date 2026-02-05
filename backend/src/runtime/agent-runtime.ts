@@ -1,26 +1,26 @@
-import { store } from "@/lib/storage";
 import { GLMStreamAssembler, parseSSEJsonLines } from "@/lib/glm-stream";
 import { OpenAIStreamAssembler } from "@/lib/openai-stream";
+import { store } from "@/lib/storage";
 
-import { AgentEventBus } from "./event-bus";
-import { createDeferred, safeJsonParse } from "./utils";
-import { getWorkspaceUIBus } from "./ui-bus";
-import { getMcpRegistry } from "./mcp";
-import { appendAgentHistorySnapshot, appendAgentLlmRequestRaw, appendAgentStreamEvent } from "./agent-logger";
-import { formatSkillPrompt, getSkillLoader } from "./skill-loader";
 import { exec } from "node:child_process";
-import { promisify } from "node:util";
 import path from "node:path";
+import { promisify } from "node:util";
+import { appendAgentHistorySnapshot, appendAgentLlmRequestRaw, appendAgentStreamEvent } from "./agent-logger";
+import { AgentEventBus } from "./event-bus";
+import { getMcpRegistry } from "./mcp";
+import { formatSkillPrompt, getSkillLoader } from "./skill-loader";
+import { getWorkspaceUIBus } from "./ui-bus";
+import { createDeferred, safeJsonParse } from "./utils";
 
 type UUID = string;
 
 type HistoryMessage =
   | {
-      role: "system" | "user" | "assistant";
-      content: string;
-      tool_calls?: unknown;
-      reasoning_content?: string;
-    }
+    role: "system" | "user" | "assistant";
+    content: string;
+    tool_calls?: unknown;
+    reasoning_content?: string;
+  }
   | { role: "tool"; content: string; tool_call_id?: string; name?: string };
 
 type ToolCall = {
@@ -276,11 +276,12 @@ function getGlmConfig() {
   return { apiKey, baseUrl, model };
 }
 
-type LlmProvider = "glm" | "openrouter";
+type LlmProvider = "glm" | "openrouter" | "deepseek";
 
 function getLlmProvider(): LlmProvider {
   const raw = (process.env.LLM_PROVIDER ?? "glm").toLowerCase();
   if (raw === "openrouter" || raw === "open-router" || raw === "or") return "openrouter";
+  if (raw === "deepseek" || raw === "deepseek-ai") return "deepseek";
   return "glm";
 }
 
@@ -308,6 +309,18 @@ function getOpenRouterConfig() {
   return { apiKey, baseUrl, model, httpReferer, appTitle };
 }
 
+function getDeepSeekConfig() {
+  const apiKey = process.env.DEEPSEEK_API_KEY ?? "";
+  const baseUrl = process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com/v1/chat/completions";
+  const model = process.env.DEEPSEEK_MODEL ?? "";
+
+  if (!apiKey) {
+    throw new Error("Missing DEEPSEEK_API_KEY");
+  }
+
+  return { apiKey, baseUrl, model };
+}
+
 class AgentRunner {
   private wake = createDeferred<void>();
   private started = false;
@@ -318,7 +331,7 @@ class AgentRunner {
     private readonly bus: AgentEventBus,
     private readonly ensureRunner: (agentId: UUID) => void,
     private readonly wakeAgent: (agentId: UUID) => void
-  ) {}
+  ) { }
 
   start() {
     if (this.started) return;
@@ -981,6 +994,9 @@ class AgentRunner {
     if (provider === "openrouter") {
       return this.callOpenRouterStreaming(history, ctx);
     }
+    if (provider === "deepseek") {
+      return this.callDeepseekStreaming(history, ctx);
+    }
     return this.callGlmStreaming(history, ctx);
   }
 
@@ -1037,6 +1053,164 @@ class AgentRunner {
     if (!upstream.ok || !upstream.body) {
       const text = await upstream.text().catch(() => "");
       throw new Error(`OpenRouter upstream error: ${upstream.status} ${text}`);
+    }
+
+    const assembler = new OpenAIStreamAssembler();
+    let prev = assembler.snapshot();
+    let assistantText = "";
+    let assistantThinking = "";
+
+    for await (const evt of parseSSEJsonLines(upstream.body)) {
+      const state = assembler.push(evt as any);
+
+      const reasoningDelta = state.reasoningContent.slice(prev.reasoningContent.length);
+      const contentDelta = state.content.slice(prev.content.length);
+      const toolCallDeltas = extractToolCallDeltas(evt as any, prev, state);
+
+      if (reasoningDelta) {
+        assistantThinking += reasoningDelta;
+        this.bus.emit(this.agentId, {
+          event: "agent.stream",
+          data: { kind: "reasoning", delta: reasoningDelta },
+        });
+        void appendAgentStreamEvent({
+          agentId: this.agentId,
+          round: ctx.round,
+          kind: "reasoning",
+          delta: reasoningDelta,
+        });
+      }
+
+      if (contentDelta) {
+        assistantText += contentDelta;
+        this.bus.emit(this.agentId, {
+          event: "agent.stream",
+          data: { kind: "content", delta: contentDelta },
+        });
+        void appendAgentStreamEvent({
+          agentId: this.agentId,
+          round: ctx.round,
+          kind: "content",
+          delta: contentDelta,
+        });
+      }
+
+      for (const delta of toolCallDeltas) {
+        this.bus.emit(this.agentId, {
+          event: "agent.stream",
+          data: {
+            kind: "tool_calls",
+            delta: delta.delta,
+            tool_call_id: delta.tool_call_id,
+            tool_call_name: delta.tool_call_name,
+          },
+        });
+        void appendAgentStreamEvent({
+          agentId: this.agentId,
+          round: ctx.round,
+          kind: "tool_calls",
+          delta: delta.delta,
+          tool_call_id: delta.tool_call_id,
+          tool_call_name: delta.tool_call_name,
+        });
+      }
+
+      prev = state;
+    }
+
+    this.bus.emit(this.agentId, {
+      event: "agent.done",
+      data: { finishReason: prev.finishReason ?? undefined },
+    });
+    void appendAgentStreamEvent({
+      agentId: this.agentId,
+      round: ctx.round,
+      kind: "done",
+      finishReason: prev.finishReason ?? null,
+    });
+    getWorkspaceUIBus().emit(ctx.workspaceId, {
+      event: "ui.agent.llm.done",
+      data: {
+        workspaceId: ctx.workspaceId,
+        agentId: this.agentId,
+        groupId: ctx.groupId,
+        round: ctx.round,
+        finishReason: prev.finishReason ?? undefined,
+      },
+    });
+
+    const finalState = assembler.snapshot();
+
+    if (finalState.usage && finalState.usage.totalTokens > 0) {
+      try {
+        await store.setGroupContextTokens({
+          groupId: ctx.groupId,
+          tokens: finalState.usage.totalTokens,
+        });
+      } catch {
+        // Best effort - don't fail if token tracking fails
+      }
+    }
+
+    return {
+      assistantText,
+      assistantThinking,
+      toolCalls: (finalState.toolCalls ?? []) as ToolCall[],
+      finishReason: finalState.finishReason,
+    };
+  }
+
+  private async callDeepseekStreaming(
+    history: HistoryMessage[],
+    ctx: { workspaceId: UUID; groupId: UUID; round: number }
+  ) {
+    const { apiKey, baseUrl, model } = getDeepSeekConfig();
+
+    getWorkspaceUIBus().emit(ctx.workspaceId, {
+      event: "ui.agent.llm.start",
+      data: {
+        workspaceId: ctx.workspaceId,
+        agentId: this.agentId,
+        groupId: ctx.groupId,
+        round: ctx.round,
+      },
+    });
+    void appendAgentStreamEvent({
+      agentId: this.agentId,
+      round: ctx.round,
+      kind: "start",
+    });
+
+    const tools = await getAgentTools();
+    const payload: Record<string, unknown> = {
+      // Preserve reasoning for DeepSeek using the canonical "reasoning" field.
+      messages: mapOpenRouterMessages(history),
+      stream: true,
+      stream_options: { include_usage: true },
+    };
+    if (model) payload.model = model;
+    if (tools.length > 0) {
+      payload.tools = tools;
+      payload.tool_choice = "auto";
+    }
+
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    };
+
+    const requestBody = JSON.stringify(payload);
+    void appendAgentLlmRequestRaw({ agentId: this.agentId, body: requestBody });
+
+    const upstream = await fetch(baseUrl, {
+      method: "POST",
+      headers,
+      body: requestBody,
+    });
+
+    if (!upstream.ok || !upstream.body) {
+      const text = await upstream.text().catch(() => "");
+      throw new Error(`DeepSeek upstream error: ${upstream.status} ${text}`);
     }
 
     const assembler = new OpenAIStreamAssembler();

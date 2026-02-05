@@ -13,6 +13,9 @@ backend/tsconfig.tsbuildinfo
 backend/.agent_logs/
 backend/.agent_stream_logs/
 backend/.agent_llm_requests/
+backend/compliance_integration
+.trae
+backend/compliance_status
 tmp/
 .gemini/
 .mcp.json
