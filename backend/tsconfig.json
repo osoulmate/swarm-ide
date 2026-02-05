@@ -33,6 +33,12 @@
       "@/runtime/*": [
         "src/runtime/*"
       ],
+      "@/models/*": [
+        "src/models/*"
+      ],
+      "@/models": [
+        "src/models"
+      ],
       "@/app/*": [
         "app/*"
       ]
